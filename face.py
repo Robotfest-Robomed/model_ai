@@ -1,111 +1,139 @@
-import os
 import cv2
+import time
 import numpy as np
-import tflite_runtime.interpreter as tflite
-import mediapipe as mp
-from collections import Counter
+import onnxruntime as ort
+import os
 
-# ----------------------------
-# Paths
-# ----------------------------
-input_folder = "input_images"   # folder with your images
-output_folder = "output_images" # folder to save results
-os.makedirs(output_folder, exist_ok=True)
+# -----------------------
+# CONFIG
+# -----------------------
+ONNX_MODEL_PATH = "your_model.onnx"  # path to your converted HDF5->ONNX model
+EMOTIONS = ["neutral","happy","surprise","sad","anger","disgust","fear","contempt"]
 
-# ----------------------------
-# Load TFLite model
-# ----------------------------
-interpreter = tflite.Interpreter(model_path="model.tflite")
-interpreter.allocate_tensors()
-input_details = interpreter.get_input_details()
-output_details = interpreter.get_output_details()
+CAMERA_WIDTH = 320
+CAMERA_HEIGHT = 240
 
-print("Model input shape:", input_details[0]['shape'])
+NEGATIVE_EMOTIONS = {"surprise", "anger"}
+ALERT_DURATION_SEC = 3  # seconds before alert triggers
 
-# ----------------------------
-# Emotion labels
-# ----------------------------
-EMOTIONS = ["angry", "disgust", "fear", "happy", "sad", "surprise", "neutral"]
+ALERT_ICON_PATH = "alert.png"  # optional transparent PNG
 
-# ----------------------------
-# Setup Mediapipe Face Detection
-# ----------------------------
-mp_face_detection = mp.solutions.face_detection
-face_detection = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+# -----------------------
+# LOAD ONNX MODEL
+# -----------------------
+sess = ort.InferenceSession(ONNX_MODEL_PATH, providers=['CPUExecutionProvider'])
+input_name = sess.get_inputs()[0].name
+output_name = sess.get_outputs()[0].name
 
-# ----------------------------
-# Counter for all emotions
-# ----------------------------
-emotion_counter = Counter()
-total_faces = 0
+# -----------------------
+# HELPER TO OVERLAY TRANSPARENT IMAGE
+# -----------------------
+def overlay_image(frame, img, x, y):
+    """Overlay img (BGRA) onto frame at position x,y"""
+    if img is None:
+        return frame
+    h, w = img.shape[:2]
+    if y < 0 or x < 0 or y+h > frame.shape[0] or x+w > frame.shape[1]:
+        return frame
+    alpha = img[:, :, 3] / 255.0
+    for c in range(3):
+        frame[y:y+h, x:x+w, c] = (alpha * img[:, :, c] + (1 - alpha) * frame[y:y+h, x:x+w, c])
+    return frame
 
-# ----------------------------
-# Process each image
-# ----------------------------
-for filename in os.listdir(input_folder):
-    if not filename.lower().endswith((".jpg", ".jpeg", ".png")):
-        continue
-
-    img_path = os.path.join(input_folder, filename)
-    frame = cv2.imread(img_path)
-    if frame is None:
-        print(f"Could not read {filename}")
-        continue
-
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_detection.process(frame_rgb)
-
-    if results.detections:
-        for detection in results.detections:
-            total_faces += 1
-
-            # Bounding box
-            bboxC = detection.location_data.relative_bounding_box
-            ih, iw, _ = frame.shape
-            x = int(bboxC.xmin * iw)
-            y = int(bboxC.ymin * ih)
-            w = int(bboxC.width * iw)
-            h = int(bboxC.height * ih)
-            x, y = max(0, x), max(0, y)
-            w, h = min(iw - x, w), min(ih - y, h)
-
-            # Crop and preprocess
-            face_color = frame[y:y+h, x:x+w]
-            face_resized = cv2.resize(face_color, (64, 64))
-            face_input = face_resized.astype("float32") / 255.0
-            face_input = np.expand_dims(face_input, axis=0)  # shape (1,64,64,3)
-
-            # Run inference
-            interpreter.set_tensor(input_details[0]['index'], face_input)
-            interpreter.invoke()
-            preds = interpreter.get_tensor(output_details[0]['index'])[0]
-
-            # Get predicted emotion
-            emotion = EMOTIONS[np.argmax(preds)]
-            confidence = np.max(preds)
-            emotion_counter[emotion] += 1
-
-            # Draw bounding box + label
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.putText(frame, f"{emotion} ({confidence:.2f})", (x, y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-    else:
-        print(f"No face detected in {filename}")
-
-    # Save output image
-    output_path = os.path.join(output_folder, filename)
-    cv2.imwrite(output_path, frame)
-    print(f"Processed {filename} → saved to {output_path}")
-
-# ----------------------------
-# Print emotion statistics
-# ----------------------------
-print("\n=== Emotion Statistics ===")
-if total_faces == 0:
-    print("No faces detected in any image.")
+# Load alert icon if exists
+alert_icon = None
+if os.path.exists(ALERT_ICON_PATH):
+    alert_icon = cv2.imread(ALERT_ICON_PATH, cv2.IMREAD_UNCHANGED)
+    if alert_icon is None:
+        print("⚠ Failed to load alert icon, continuing without it")
 else:
-    for emotion in EMOTIONS:
-        count = emotion_counter[emotion]
-        percentage = (count / total_faces) * 100
-        print(f"{emotion}: {count} faces ({percentage:.2f}%)")
+    print("⚠ Alert icon not found, continuing without it")
+
+# -----------------------
+# CAMERA SETUP
+# -----------------------
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    raise RuntimeError("Cannot open webcam")
+
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+print("✔ Camera started. Press 'q' to quit.")
+
+prev_time = time.time()
+alert_start_time = None
+alert_triggered = False
+
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Resize and grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        face_input = cv2.resize(gray, (64,64)).astype(np.float32)/255.0
+        face_input = np.expand_dims(face_input, axis=(0,3))  # [1,64,64,1]
+
+        # ONNX inference
+        outputs = sess.run([output_name], {input_name: face_input})
+        logits = outputs[0][0]
+        probs = np.exp(logits)/np.sum(np.exp(logits))
+        emotion_idx = int(np.argmax(probs))
+        emotion_label = EMOTIONS[emotion_idx]
+
+        # FPS
+        now = time.time()
+        fps = 1/(now-prev_time)
+        prev_time = now
+
+        # Print emotion and FPS
+        print(f"Emotion: {emotion_label:<8} | FPS: {fps:.1f}")
+
+        # Check for negative emotions
+        if not alert_triggered and emotion_label.lower() in NEGATIVE_EMOTIONS:
+            if alert_start_time is None:
+                alert_start_time = now
+            elif now - alert_start_time >= ALERT_DURATION_SEC:
+                alert_triggered = True
+        else:
+            alert_start_time = None  # reset if neutral/happy/etc
+
+        # Show alert if triggered (no white overlay)
+        if alert_triggered:
+            # Draw icon in center
+            if alert_icon is not None:
+                ih, iw = alert_icon.shape[:2]
+                scale = 0.3  # 30% of original size
+                icon_resized = cv2.resize(alert_icon, (int(iw*scale), int(ih*scale)))
+                ih, iw = icon_resized.shape[:2]
+                frame = overlay_image(frame, icon_resized,
+                                      x=CAMERA_WIDTH//2 - iw//2,
+                                      y=CAMERA_HEIGHT//2 - ih//2 - 10)
+
+            # Draw text slightly below icon
+            title = "ASTHMA ALERT!"
+            subtitle = "Negative Emotion Detected"
+            font_scale_title = 0.35 * CAMERA_WIDTH / 320
+            font_scale_sub = 0.2 * CAMERA_WIDTH / 320
+            thickness_title = 1
+            thickness_sub = 1
+
+            (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_DUPLEX, font_scale_title, thickness_title)
+            (sw, sh), _ = cv2.getTextSize(subtitle, cv2.FONT_HERSHEY_DUPLEX, font_scale_sub, thickness_sub)
+
+            frame = cv2.putText(frame, title, (CAMERA_WIDTH//2 - tw//2, CAMERA_HEIGHT//2 + ih//2 + 10),
+                                cv2.FONT_HERSHEY_DUPLEX, font_scale_title, (0,0,255), thickness_title)
+            frame = cv2.putText(frame, subtitle, (CAMERA_WIDTH//2 - sw//2, CAMERA_HEIGHT//2 + ih//2 + 25),
+                                cv2.FONT_HERSHEY_DUPLEX, font_scale_sub, (0,0,255), thickness_sub)
+
+        # Show camera feed
+        cv2.imshow("Emotion Detection", frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()

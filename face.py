@@ -2,138 +2,222 @@ import cv2
 import time
 import numpy as np
 import onnxruntime as ort
+import math
 import os
 
-# -----------------------
+# -----------------------------------
 # CONFIG
-# -----------------------
-ONNX_MODEL_PATH = "your_model.onnx"  # path to your converted HDF5->ONNX model
-EMOTIONS = ["neutral","happy","surprise","sad","anger","disgust","fear","contempt"]
+# -----------------------------------
+EMOTION_MODEL = "your_model.onnx"
+POSE_MODEL = "model.onnx"
+ALERT_IMAGE_PATH = "alert.png"
 
-CAMERA_WIDTH = 320
-CAMERA_HEIGHT = 240
+EMOTIONS = ["fear","neutral","happy","sad","anger","disgust","surprise","contempt"]
+NEGATIVE_EMOTIONS = {"surprise","fear","disgust"}
 
-NEGATIVE_EMOTIONS = {"surprise", "anger"}
-ALERT_DURATION_SEC = 3  # seconds before alert triggers
+EMOTION_ALERT_SEC = 1.0
+HAND_NEAR_NECK_SEC = 1.0
 
-ALERT_ICON_PATH = "alert.png"  # optional transparent PNG
+POSE_INPUT_SIZE = 192
+HAND_NEAR_THRESHOLD = 0.30
 
-# -----------------------
-# LOAD ONNX MODEL
-# -----------------------
-sess = ort.InferenceSession(ONNX_MODEL_PATH, providers=['CPUExecutionProvider'])
-input_name = sess.get_inputs()[0].name
-output_name = sess.get_outputs()[0].name
+# -----------------------------------
+# LOAD MODELS
+# -----------------------------------
+emotion_sess = ort.InferenceSession(EMOTION_MODEL, providers=["CPUExecutionProvider"])
+emotion_in = emotion_sess.get_inputs()[0].name
+emotion_out = emotion_sess.get_outputs()[0].name
 
-# -----------------------
-# HELPER TO OVERLAY TRANSPARENT IMAGE
-# -----------------------
-def overlay_image(frame, img, x, y):
-    """Overlay img (BGRA) onto frame at position x,y"""
-    if img is None:
-        return frame
-    h, w = img.shape[:2]
-    if y < 0 or x < 0 or y+h > frame.shape[0] or x+w > frame.shape[1]:
-        return frame
-    alpha = img[:, :, 3] / 255.0
-    for c in range(3):
-        frame[y:y+h, x:x+w, c] = (alpha * img[:, :, c] + (1 - alpha) * frame[y:y+h, x:x+w, c])
+pose_sess = ort.InferenceSession(POSE_MODEL, providers=["CPUExecutionProvider"])
+pose_in = pose_sess.get_inputs()[0].name
+pose_out = pose_sess.get_outputs()[0].name
+
+# -----------------------------------
+# ALERT IMAGE
+# -----------------------------------
+if os.path.exists(ALERT_IMAGE_PATH):
+    alert_img = cv2.imread(ALERT_IMAGE_PATH)
+else:
+    alert_img = None
+    print("⚠ WARNING: alert.png NOT FOUND!")
+
+# -----------------------------------
+# DRAW POSE
+# -----------------------------------
+SKELETON = [
+    (0,1),(0,2),(1,3),(2,4),
+    (0,5),(0,6),
+    (5,7),(7,9),
+    (6,8),(8,10),
+    (5,6),
+    (5,11),(6,12),
+    (11,13),(13,15),
+    (12,14),(14,16),
+    (11,12)
+]
+
+def draw_pose(frame, kp):
+    h, w, _ = frame.shape
+
+    for (y, x, s) in kp:
+        if s > 0.2:
+            cv2.circle(frame, (int(x*w), int(y*h)), 3, (0,255,0), -1)
+
+    for a,b in SKELETON:
+        y1,x1,s1 = kp[a]
+        y2,x2,s2 = kp[b]
+        if s1>0.2 and s2>0.2:
+            cv2.line(frame,
+                     (int(x1*w),int(y1*h)),
+                     (int(x2*w),int(y2*h)),
+                     (0,255,255),2)
     return frame
 
-# Load alert icon if exists
-alert_icon = None
-if os.path.exists(ALERT_ICON_PATH):
-    alert_icon = cv2.imread(ALERT_ICON_PATH, cv2.IMREAD_UNCHANGED)
-    if alert_icon is None:
-        print("⚠ Failed to load alert icon, continuing without it")
-else:
-    print("⚠ Alert icon not found, continuing without it")
+# -----------------------------------
+# HAND NEAR NECK RULE
+# -----------------------------------
+hand_near_start = None
 
-# -----------------------
-# CAMERA SETUP
-# -----------------------
+def check_hand_near_neck(kp):
+    global hand_near_start
+
+    ls_y,ls_x,ls_s = kp[5]
+    rs_y,rs_x,rs_s = kp[6]
+
+    if ls_s<0.2 or rs_s<0.2:
+        hand_near_start = None
+        return False, None
+
+    neck_x = (ls_x + rs_x) / 2
+    neck_y = (ls_y + rs_y) / 2
+
+    lw_y,lw_x,lw_s = kp[9]
+    rw_y,rw_x,rw_s = kp[10]
+
+    hands = []
+    if lw_s > 0.2: hands.append((lw_x, lw_y))
+    if rw_s > 0.2: hands.append((rw_x, rw_y))
+
+    near = False
+    for (hx,hy) in hands:
+        d = math.sqrt((hx-neck_x)**2 + (hy-neck_y)**2)
+        if d < HAND_NEAR_THRESHOLD:
+            near = True
+
+    now = time.time()
+
+    if near:
+        if hand_near_start is None:
+            hand_near_start = now
+        elif now - hand_near_start >= HAND_NEAR_NECK_SEC:
+            return True, (neck_x, neck_y)
+    else:
+        hand_near_start = None
+
+    return False, (neck_x, neck_y)
+
+# -----------------------------------
+# MAIN CAMERA LOOP
+# -----------------------------------
 cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError("Cannot open webcam")
+cap.set(3, 320)
+cap.set(4, 240)
 
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+pose_mode = False
+emotion_start = None
+asthma_alert = False
 
-print("✔ Camera started. Press 'q' to quit.")
+print("✔ Emotion → Pose Asthma Detection Started")
 
 prev_time = time.time()
-alert_start_time = None
-alert_triggered = False
+fps = 0
 
-try:
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
 
-        # Resize and grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        face_input = cv2.resize(gray, (64,64)).astype(np.float32)/255.0
-        face_input = np.expand_dims(face_input, axis=(0,3))  # [1,64,64,1]
+    # -------------------------
+    # FPS CALCULATION
+    # -------------------------
+    now = time.time()
+    dt = now - prev_time
+    prev_time = now
+    fps = 1 / dt if dt > 0 else 0
 
-        # ONNX inference
-        outputs = sess.run([output_name], {input_name: face_input})
-        logits = outputs[0][0]
-        probs = np.exp(logits)/np.sum(np.exp(logits))
-        emotion_idx = int(np.argmax(probs))
-        emotion_label = EMOTIONS[emotion_idx]
+    # STOP ALL DETECTION IF ALERT TRIGGERED
+    if asthma_alert:
+        if alert_img is not None:
+            alert_resized = cv2.resize(alert_img, (frame.shape[1], frame.shape[0]))
+            frame = alert_resized
 
-        # FPS
-        now = time.time()
-        fps = 1/(now-prev_time)
-        prev_time = now
+        cv2.putText(frame, "!!! ASTHMA ALERT !!!", (20,40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1,(0,0,255),3)
 
-        # Print emotion and FPS
-        print(f"Emotion: {emotion_label:<8} | FPS: {fps:.1f}")
-
-        # Check for negative emotions
-        if not alert_triggered and emotion_label.lower() in NEGATIVE_EMOTIONS:
-            if alert_start_time is None:
-                alert_start_time = now
-            elif now - alert_start_time >= ALERT_DURATION_SEC:
-                alert_triggered = True
-        else:
-            alert_start_time = None  # reset if neutral/happy/etc
-
-        # Show alert if triggered (no white overlay)
-        if alert_triggered:
-            # Draw icon in center
-            if alert_icon is not None:
-                ih, iw = alert_icon.shape[:2]
-                scale = 0.3  # 30% of original size
-                icon_resized = cv2.resize(alert_icon, (int(iw*scale), int(ih*scale)))
-                ih, iw = icon_resized.shape[:2]
-                frame = overlay_image(frame, icon_resized,
-                                      x=CAMERA_WIDTH//2 - iw//2,
-                                      y=CAMERA_HEIGHT//2 - ih//2 - 10)
-
-            # Draw text slightly below icon
-            title = "ASTHMA ALERT!"
-            subtitle = "Negative Emotion Detected"
-            font_scale_title = 0.35 * CAMERA_WIDTH / 320
-            font_scale_sub = 0.2 * CAMERA_WIDTH / 320
-            thickness_title = 1
-            thickness_sub = 1
-
-            (tw, th), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_DUPLEX, font_scale_title, thickness_title)
-            (sw, sh), _ = cv2.getTextSize(subtitle, cv2.FONT_HERSHEY_DUPLEX, font_scale_sub, thickness_sub)
-
-            frame = cv2.putText(frame, title, (CAMERA_WIDTH//2 - tw//2, CAMERA_HEIGHT//2 + ih//2 + 10),
-                                cv2.FONT_HERSHEY_DUPLEX, font_scale_title, (0,0,255), thickness_title)
-            frame = cv2.putText(frame, subtitle, (CAMERA_WIDTH//2 - sw//2, CAMERA_HEIGHT//2 + ih//2 + 25),
-                                cv2.FONT_HERSHEY_DUPLEX, font_scale_sub, (0,0,255), thickness_sub)
-
-        # Show camera feed
-        cv2.imshow("Emotion Detection", frame)
-
+        cv2.imshow("ASTHMA AI", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
+        continue  # ← stops processing but keeps window open
 
-finally:
-    cap.release()
-    cv2.destroyAllWindows()
+    # ---------------------------------------
+    # EMOTION DETECTION
+    # ---------------------------------------
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    e_in = cv2.resize(gray, (64,64)).astype(np.float32) / 255.0
+    e_in = np.expand_dims(e_in, (0,3))
+
+    out = emotion_sess.run([emotion_out], {emotion_in: e_in})
+    logits = out[0][0]
+    probs = np.exp(logits) / np.sum(np.exp(logits))
+    e_idx = int(np.argmax(probs))
+    emotion = EMOTIONS[e_idx]
+
+    cv2.putText(frame, f"Emotion: {emotion}", (5,20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+
+    # ---------------------------------------
+    # ACTIVATE POSE MODE
+    # ---------------------------------------
+    if emotion.lower() in NEGATIVE_EMOTIONS:
+        if emotion_start is None:
+            emotion_start = now
+        elif now - emotion_start >= EMOTION_ALERT_SEC:
+            pose_mode = True
+    else:
+        emotion_start = None
+
+    # ---------------------------------------
+    # POSE MODE ACTIVE
+    # ---------------------------------------
+    if pose_mode:
+        p_in = cv2.resize(frame, (POSE_INPUT_SIZE, POSE_INPUT_SIZE))
+        p_in = cv2.cvtColor(p_in, cv2.COLOR_BGR2RGB)
+        p_in = p_in.astype(np.int32)[np.newaxis, ...]
+
+        out = pose_sess.run([pose_out], {pose_in: p_in})
+        kp = out[0][0][0]
+
+        frame = draw_pose(frame, kp)
+
+        hand_alert, neck_point = check_hand_near_neck(kp)
+
+        if neck_point is not None:
+            H,W,_ = frame.shape
+            cx,cy = int(neck_point[0]*W), int(neck_point[1]*H)
+            cv2.circle(frame, (cx,cy), 5, (0,0,255), -1)
+
+        if hand_alert:
+            asthma_alert = True
+
+    # -------------------------
+    # DRAW FPS
+    # -------------------------
+    cv2.putText(frame, f"FPS: {fps:.1f}", (frame.shape[1]-90,20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0),1)
+
+    cv2.imshow("ASTHMA AI", frame)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
